@@ -1,0 +1,1876 @@
+import torch
+import torch.nn as nn  # 神经网络模块
+import torch.optim as optim # 优化器模块，提供梯度更新机制
+import torch.nn.functional as F 
+# 提供函数式接口实现激活、损失计算等操作；nn类需实例化，nn.functional直接调用
+
+from torch.utils.data import DataLoader,random_split 
+'''
+提供数据加载与数据集分割的标准化工具,解耦数据准备与模型训练，
+实现“边训练边加载”，避免内存爆炸;
+'''
+import torchvision # 提供数据集、预训练模型、图像变换等开箱即用的组件
+import torchvision.transforms as transforms
+# 图像预处理流水线,数据增强\格式转换;
+
+import numpy as np
+# 科学计算库；数据预处理/后处理/评估：NumPy 主导；创建张量、初始化权重；模型参数保存、CSV 加载
+import pandas as pd
+'''
+基于 NumPy 构建的高级数据操作库；提供带标签的二维表格（DataFrame）和一维序列（Series），解决“带列名的表格操作”痛点;
+数据 I/O;数据清洗;特征工程;时间序列
+'''
+import matplotlib.pyplot as plt
+'''
+绘图接口;训练曲线、分布分析;可视化输入/特征图/注意力;多图对比（原始图 vs 预测图）;实时训练监控（动态更新曲线）
+'''
+import seaborn as sns
+'''
+基于 Matplotlib 的统计可视化库;内置统计推断（置信区间/分布拟合/假设检验可视化）
+关系探索[特征相关性扫描];分布分析[检查数据偏态/异常值];分类对比[不同类别的特征分布对比];
+热力图[混淆矩阵/相关系数矩阵（CV/NLP 必用）];回归可视化[特征与目标变量关系 + 置信区间]
+中文支持：需额外设置：plt.rcParams['font.sans-serif'] = ['SimHei']（Seaborn 不覆盖字体）
+'''
+from sklearn.metrics import confusion_matrix,classification_report
+'''
+confusion_matrix错误模式显微镜[预测 vs 真实标签的交叉统计]
+对角线高亮 → 模型擅长识别的类别;
+非对角线热点 → 混淆对（如“猫”常被误判为“狗”）;
+归一化后 → 消除类别不平衡干扰，聚焦错误比例;
+
+classification_report性能仪表盘[精确率/召回率/F1/支持度等综合指标]
+Precision[“预测为正的样本中多少是真的”][垃圾邮件过滤（避免误杀）]
+Recall[“真实为正的样本中找出了多少”][医疗诊断（避免漏诊）]
+F1-score[Precision 与 Recall 的调和平均][综合评估（尤其不平衡数据）]
+Support[指标可靠性参考（support 小则波动大）][识别小类别评估风险]
+'''
+
+import os # 全程使用 os.path.join() 消除平台差异
+import time
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+'''
+示例
+warnings.filterwarnings(
+    'ignore', 
+    category=UserWarning, 
+    message=".*torch.meshgrid.*"  
+    module='**' 
+)
+RuntimeWarning[数值计算异常（除零、NaN），可能影响模型]
+DeprecationWarning[API 即将废弃，需规划迁移]
+FutureWarning[行为未来变更，当前仍安全]
+UserWarning[库开发者提示，通常无害]
+ConvergenceWarning[优化未收敛，影响模型质量]
+'''
+from tqdm import tqdm  # 进度条
+
+
+
+if __name__=='__main__':
+    from multiprocessing import freeze_support
+    freeze_support()  # Windows 下必须加
+
+    # 设置中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False  # 显示负号正常
+
+    # 设置随机种子
+    def set_seed(seed=42):
+        torch.manual_seed(seed) # 设置 PyTorch 的 CPU 随机种子。
+        torch.cuda.manual_seed(seed) # 设置 GPU 上的随机种子
+        torch.cuda.manual_seed_all(seed) # 设置所有 GPU 设备的随机种子
+        np.random.seed(seed) 
+        # 设置 NumPy 的随机种子;因为很多数据处理（如划分数据集、打乱顺序）使用 NumPy，所以需要同步其随机状态。
+        torch.backends.cudnn.deterministic=True # 使用了CuDNN 加速卷积
+        torch.backends.cudnn.benchmark=False 
+        # 关闭 CuDNN 的自动算法选择（benchmark）,可以保证每次使用相同的算法，从而提高可复现性。
+
+    set_seed(42) # 调用函数，将随机种子设为 42，初始化所有相关库的随机状态
+
+    # 检查GPU是否可用
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用的设备：{device}")
+    print(f"PyTorch版本：{torch.__version__}")
+    print(f"CUDA是否可用：{torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU型号：{torch.cuda.get_device_name(0)}")
+
+    # 数据加载与探索
+    class MNISTDataLoader:
+        def __init__(self,batch_size=64):
+            self.batch_size=batch_size
+            # 构造函数 __init__初始化方法,每次从数据集中读取一批（batch）样本
+
+            self.transform=transforms.Compose(  
+                    #transforms.Compose 将多个变换操作组合成一个流程，按顺序执行
+                [
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.1307,),(0.3081,))
+                    # # 标准化,目的是让输入数据分布更接近标准正态分布，有助于模型更快收敛。
+                    # MNIST数据集的均值和标准差是已知的 output=(input-mean[0.1307]/std[0.3081])
+                ]
+            )
+        
+        def load_data(self):
+            print("正在下载MNIST数据集...")
+
+            # 下载训练集
+            train_dataset=torchvision.datasets.MNIST(
+                root='./data/cnn_mnist_torch',  # 数据保存路径
+                train=True,     # 训练集
+                download=True,  # 如果不存在则下载
+                transform=self.transform # 应用预处理
+            )
+
+            # 下载测试集
+            test_dataset=torchvision.datasets.MNIST(
+                root='./data/cnn_mnist_torch',
+                train=False,  # 测试集
+                download=True,
+                transform=self.transform
+            )
+
+            print(f"训练集大小：{len(train_dataset)}")
+            print(f"测试集大小：{len(test_dataset)}")
+
+            # 划分训练集和验证集（80%训练，20%验证）
+            train_size=int(0.8*len(train_dataset))
+            val_size=len(train_dataset)-train_size  
+            # 不能直接用0.2，会导致数据重复
+            train_dataset,val_dataset = random_split(
+                train_dataset,[train_size,val_size]
+            ) # 右侧train_dataset是原始数据，拆分后覆盖左侧
+
+            print(f"训练集：{len(train_dataset)}个样本")
+            print(f"验证集：{len(val_dataset)}个样本")
+            print(f"测试集：{len(test_dataset)}个样本")
+
+            # 创建数据加载器
+            train_loader=DataLoader(
+                train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,  # 打乱顺序，提高泛化能力
+                num_workers=2  
+            )
+
+            val_loader=DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False, # 不打乱，保证评估一致性，便于比较性能。
+                num_workers=2
+            )
+
+            test_loader=DataLoader(
+                test_dataset,
+                batch_size=self.batch_size,
+                shuffle=False, # 不打乱，保证可复现性。
+                num_workers=2
+            )
+
+            return train_loader,val_loader,test_loader
+    
+    # 使用数据加载器
+    data_loader=MNISTDataLoader(batch_size=64)
+    train_loader,val_loader,test_loader = data_loader.load_data()  
+
+    # 探索数据集
+    def explore_dataset(train_loader):
+        '''
+        探索数据集特征
+        '''
+        # 获取一个批次的数据
+        data_iter=iter(train_loader)   # 创建一个迭代器
+        images,labels=next(data_iter)
+        '''
+        从迭代器中取出第一个批次的数据
+        images: 一批图像张量，形状通常是 [batch_size, channels, height, width]
+        labels: 对应这批图像的标签张量，形状通常是 [batch_size]
+        '''
+        print("\n" + "="*60)
+        print("数据集探索")
+        print("="*60)
+
+        print(f"图像张量形状：{images.shape}")  # shape返回张量在每个维度上的尺寸大小
+        print(f"标签张量形状: {labels.shape}")
+        print(f"像素值范围: [{images.min():.3f}, {images.max():.3f}]")
+        print(f"标签值范围: [{labels.min()}, {labels.max()}]")
+
+        # 检查批次中的标签分布
+        '''
+        labels 是一个 PyTorch 张量，通常是一维的，比如 [2, 1, 0, 2, 3, 1]，表示每张图像的类别。
+        unique: 所有不重复的标签值（如 [0, 1, 2, 3]）
+        counts: 对应每个标签出现的次数（如 [1, 2, 2, 1]）
+        '''
+        unique, counts = torch.unique(labels, return_counts=True)
+        print(f"当前批次标签分布:")
+        for label, count in zip(unique, counts):
+            print(f"数字 {label.item()}: {count}个")
+        '''
+        使用 zip(unique, counts) 将标签和对应的计数一一配对遍历
+        因为 label 是一个标量张量，需要用 .item() 提取其 Python 原始数值。
+        '''
+        return images, labels
+
+    images,labels=explore_dataset(train_loader)
+
+    class DataVisualizer:
+        '''
+        数据可视化工具
+        '''
+
+        @staticmethod
+        def visualize_samples(images,labels,num_samples=10):
+            '''
+            images: 图像张量，形状通常是 [batch_size, 1, 28, 28]（MNIST 是灰度图）
+            labels: 对应的标签张量，形状 [batch_size]
+            num_samples=10: 要显示的样本数量，默认为 10
+            '''
+            # 可视化样本图片
+            fig, axes = plt.subplots(2, 5, figsize=(12, 6))
+            '''
+            plt.subplots创建一个包含 2 行 × 5 列 = 10 个子图的图形窗口
+            figsize=(12, 6) 设置图像大小为宽 12 英寸、高 6 英寸
+            '''
+            axes = axes.ravel()
+            # 将二维的 axes 数组展平为一维数组，方便按顺序索引（如 axes[0], axes[1], ...）
+            
+            for i in range(min(num_samples, len(images))):
+                # 使用 min() 防止越界
+
+                # 转换为numpy数组并调整维度
+                img = images[i].squeeze().numpy()  # 去除通道维度
+                '''
+                images[i]：获取第 i 个图像，形状为 [1, 28, 28]
+                .squeeze()：移除大小为 1 的维度 → 变成 [28, 28]
+                .numpy()：转换为 NumPy 数组，以便 Matplotlib 使用
+                '''
+                label = labels[i].item()
+                # 从标量张量中提取 Python 数值（如 tensor(3) → 3）
+                
+                axes[i].imshow(img, cmap='gray')
+                # 显示图像，'gray'灰度图;彩色图需改用 'RGB'
+                axes[i].set_title(f"标签: {label}", fontsize=12, fontweight='bold')
+                # 在每个子图上方添加标题“标签: X”，字体加粗
+                axes[i].axis('off')
+                # 关闭坐标轴刻度线和标签，使图像更干净
+
+                
+                # 添加像素值信息
+                img_flat = img.flatten() # 将图像拉平为一维数组，便于计算统计量
+                axes[i].text(0.5, -0.15, 
+                        f"均值: {img.mean():.2f}\n标准差: {img.std():.2f}",
+                        transform=axes[i].transAxes,
+                        ha='center', fontsize=9)
+                '''
+                在子图下方添加文本框，显示该图像的像素均值和标准差
+                transform=axes[i].transAxes：表示坐标是相对于子图的（0~1），不是像素坐标
+                '''
+            
+            plt.suptitle('MNIST手写数字样本', fontsize=16, fontweight='bold', y=1.05)
+            # y=1.05：将标题稍微上移，避免被截断
+            plt.tight_layout() # 自动调整子图间距，防止重叠
+            plt.show()
+
+        @staticmethod
+        def visualize_distribution(train_loader, val_loader, test_loader):
+            """可视化数据集分布"""
+            def count_labels(loader):
+                """统计数据集中每个标签的数量"""
+                all_labels = []
+                for _, labels in loader:
+                    all_labels.extend(labels.numpy())
+                '''
+                _ 表示忽略图像数据（因为我们只关心标签）
+                labels 是当前批次的标签张量
+                使用 .extend() 而不是 .append() 是为了将每个标签单独加入列表（避免嵌套结构）
+                '''
+                unique, counts = np.unique(all_labels, return_counts=True)
+                '''
+                np.unique()：找出所有不重复的标签值（即类别编号），并返回其出现次数。
+                return_counts=True：同时返回每个唯一值的计数。
+                '''
+                return unique, counts
+            
+
+            '''
+            调用 count_labels() 分别统计三个数据集的标签分布
+            train_unique: 训练集的类别编号
+            train_counts: 每个类别的样本数
+            '''
+            train_unique, train_counts = count_labels(train_loader)
+            val_unique, val_counts = count_labels(val_loader)
+            test_unique, test_counts = count_labels(test_loader)
+
+            # 创建DataFrame,用于构建结构化表格，可以用于后续分析或导出为 CSV 文件
+            df_train = pd.DataFrame({
+                '数字': train_unique,
+                '训练集': train_counts,
+                '验证集': val_counts,
+                '测试集': test_counts
+            })
+
+            # 绘制堆叠柱状图
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            '''
+            fig 是 Figure 对象（整个图形窗口/画布）,最高层级的容器
+            1 行 × 2 列 → 左右两个子图
+            figsize=(14, 6)：设置图像大小为宽 14 英寸、高 6 英寸
+            '''
+            
+            # 子图1：各数据集分布
+            x = np.arange(10)
+            width = 0.25
+
+            '''
+            x - width, x, x + width 实现了三组柱子并排显示
+            这不是“堆叠”图（stacked bar），而是“分组柱状图”（grouped bar）。真正的堆叠图会把多个值叠加在同一位置。
+            '''
+            axes[0].bar(x - width, train_counts, width, label='训练集', alpha=0.8)
+            axes[0].bar(x, val_counts, width, label='验证集', alpha=0.8)
+            axes[0].bar(x + width, test_counts, width, label='测试集', alpha=0.8)
+            
+            axes[0].set_xlabel('数字', fontsize=12)
+            axes[0].set_ylabel('样本数量', fontsize=12)
+            axes[0].set_title('各数据集数字分布', fontsize=14, fontweight='bold')
+            axes[0].set_xticks(x) # 设置 X 轴刻度位置
+            axes[0].set_xticklabels([str(i) for i in range(10)]) # 设置 X 轴刻度标签（0~9）
+            axes[0].legend() # 显示图例
+            axes[0].grid(True, alpha=0.3, axis='y') # 添加浅灰色 Y 轴网格线，增强可读性
+
+            # 子图2：占比饼图
+            total_train = sum(train_counts)
+            train_percentages = [count/total_train*100 for count in train_counts]  # 使用列表推导式将每个类别的样本数转换为百分比
+            
+            '''
+            使用 Matplotlib 内置的 Set3 颜色映射（适合分类数据）
+            colors：返回一个包含 10 种不同颜色的数组，用于区分不同类别
+            '''
+            colors = plt.cm.Set3(np.arange(10)/10)
+
+            '''
+            wedges: 扇形本身（可用作动画或高亮）
+            texts: 外部标签文本
+            autotexts: 内部百分比文本
+            '''
+            wedges, texts, autotexts = axes[1].pie(
+                train_percentages,  # 每个扇形的大小（百分比）
+                labels=[str(i) for i in range(10)], # 扇形外侧的文字标签（"0", "1", ..., "9"）
+                colors=colors,
+                autopct='%1.1f%%', # 在扇形内部显示百分比数值（保留一位小数）
+                startangle=90 # 从顶部开始绘制第一个扇形（使图表更美观）
+            )
+            
+            axes[1].set_title('训练集数字分布比例', fontsize=14, fontweight='bold')
+
+            # 美化饼图
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontweight('bold')
+            
+            plt.tight_layout() # 自动调整子图间距，防止重叠
+            plt.show()
+
+            # 打印统计信息
+            print("\n数据集统计信息:")
+            print(df_train.to_string(index=False))
+            print(f"\n训练集总数: {total_train}")
+            print(f"验证集总数: {sum(val_counts)}")
+            print(f"测试集总数: {sum(test_counts)}")
+
+            # 检查类别平衡性
+            train_std = np.std(train_counts)
+            train_mean = np.mean(train_counts)
+            imbalance_ratio = train_std / train_mean
+            
+            print(f"\n类别平衡性分析:")
+            print(f"  各类别平均样本数: {train_mean:.1f}")  # 每个类别的平均样本数
+            print(f"  样本数标准差: {train_std:.1f}") # 样本数的标准差（衡量波动程度）
+            print(f"  不平衡比率: {imbalance_ratio:.3f}") # 不平衡比率（越小表示越均衡）
+            print(f"  结论: {'类别较平衡' if imbalance_ratio < 0.3 else '类别不平衡'}") # 经验法则：当标准差小于均值的 30% 时，可认为数据基本均衡
+
+
+        @staticmethod
+        def visualize_image_statistics(images):
+            """可视化图像统计特性"""
+            # 计算像素统计
+            pixel_values = images.numpy().flatten()
+            '''
+            .flatten()：将所有维度展平为一维数组（如 64×1×28×28 → 45152 个像素值）
+            images.numpy()：将 PyTorch 张量转换为 NumPy 数组
+            '''
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4)) 
+            '''
+            创建一个包含 1 行 × 3 列 的子图布局
+            '''
+
+            # 子图1：像素值分布直方图  axes[0].hist(...)直方图绘制
+            axes[0].hist(pixel_values, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
+            '''
+            bins=50：将像素值范围分为 50 个区间
+            alpha=0.7：设置透明度，避免遮挡
+            edgecolor='black'：柱子边框颜色，增强清晰度
+            '''
+
+            axes[0].axvline(x=np.mean(pixel_values), color='red', linestyle='--', 
+                        linewidth=2, label=f'均值: {np.mean(pixel_values):.3f}')
+            '''
+            添加一条红色虚线表示 均值
+            axvline()：垂直线
+            x=np.mean(...)：位置为均值
+            '''
+
+            axes[0].axvline(x=np.median(pixel_values), color='green', linestyle='--', 
+                        linewidth=2, label=f'中位数: {np.median(pixel_values):.3f}')
+            '''
+            添加一条绿色实线表示中位数
+            中位数是排序后中间的值，对异常值不敏感
+            '''
+
+            axes[0].set_xlabel('像素值', fontsize=12)
+            axes[0].set_ylabel('频率', fontsize=12)
+            axes[0].set_title('像素值分布', fontsize=14, fontweight='bold')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            # 子图2：图像亮度分布直方图（按图像）
+            image_means = images.numpy().mean(axis=(1, 2, 3))
+            axes[1].hist(image_means, bins=30, alpha=0.7, color='lightcoral', edgecolor='black')
+            axes[1].set_xlabel('图像平均亮度', fontsize=12)
+            axes[1].set_ylabel('图像数量', fontsize=12)
+            axes[1].set_title('图像亮度分布', fontsize=14, fontweight='bold')
+            axes[1].grid(True, alpha=0.3)
+
+            # 子图3：不同数字的平均图像
+            # 这里需要标签信息，暂时跳过，后面会实现
+            axes[2].text(0.5, 0.5, '不同数字的平均图像\n将在训练后展示',
+                        ha='center', va='center', fontsize=12, transform=axes[2].transAxes)
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            plt.show()
+
+            # 打印统计信息
+            print("\n图像统计信息:")
+            print(f"  像素值范围: [{pixel_values.min():.3f}, {pixel_values.max():.3f}]")
+            print(f"  像素均值: {np.mean(pixel_values):.3f}")
+            print(f"  像素标准差: {np.std(pixel_values):.3f}")
+            print(f"  图像平均亮度范围: [{image_means.min():.3f}, {image_means.max():.3f}]")
+
+    # 执行数据可视化
+    print("\n" + "="*60)
+    print("数据可视化")
+    print("="*60)
+
+    # 1. 可视化样本
+    print("\n"+"可视化随机样本:")
+    DataVisualizer.visualize_samples(images, labels)
+
+    # 2. 可视化数据集分布
+    print("\n2. 可视化数据集分布:")
+    DataVisualizer.visualize_distribution(train_loader,val_loader,test_loader)
+
+    # 3. 可视化图像统计特性
+    print("\n3. 可视化图像统计特性:")
+    DataVisualizer.visualize_image_statistics(images)
+
+
+    class DigitRecognizerCNN(nn.Module):
+        """
+        手写数字识别CNN模型
+        
+        设计思路：
+        1. 输入：28×28×1的灰度图像
+        2. 使用多个卷积层提取特征
+        3. 使用池化层降低空间维度
+        4. 使用全连接层进行分类
+        5. 输出：10个数字的概率分布
+        
+        架构：
+        Conv1 (3x3) → ReLU → BatchNorm → Conv2 (3x3) → ReLU → BatchNorm → MaxPool
+        Conv3 (3x3) → ReLU → BatchNorm → Conv4 (3x3) → ReLU → BatchNorm → MaxPool
+        Flatten → Dropout → FC1 → ReLU → Dropout → FC2 → ReLU → FC3 (输出)
+        """
+
+        def __init__(self, num_classes=10, dropout_rate=0.5): # dropout用于防止过拟合
+            super(DigitRecognizerCNN, self).__init__()  # 调用父类初始化，确保模块正确注册子层
+            
+            # 特征提取部分
+            self.features = nn.Sequential(   # 这是一个由多个卷积层、批归一化层、激活函数和池化层组成的特征提取器，分为三个“卷积块”，每个块负责提取不同层次的特征
+                # 第一卷积块：提取低级特征（边缘、角点）
+                nn.Conv2d(1, 32, kernel_size=3, padding=1),  # 28×28×1 → 28×28×32
+                nn.BatchNorm2d(32),  # 批量归一化
+                nn.ReLU(),  # ReLU 激活函数引入非线性
+                
+                nn.Conv2d(32, 32, kernel_size=3, padding=1),  # 28×28×32 → 28×28×32
+                nn.BatchNorm2d(32),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),        # 28×28×32 → 14×14×32   最大池化MaxPool2将空间尺寸减半
+
+                # 第二卷积块：提取中级特征（纹理、形状）
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),  # 14×14×32 → 14×14×64
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                
+                nn.Conv2d(64, 64, kernel_size=3, padding=1),  # 14×14×64 → 14×14×64
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),        # 14×14×64 → 7×7×64
+
+                # 第三卷积块：提取高级特征（部件组合）
+                nn.Conv2d(64, 128, kernel_size=3, padding=1), # 7×7×64 → 7×7×128
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                
+                nn.Conv2d(128, 128, kernel_size=3, padding=1), # 7×7×128 → 7×7×128
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+            )
+
+            # 全连接层\分类器部分
+            self.classifier = nn.Sequential(
+                nn.Dropout(dropout_rate),
+                nn.Linear(128 * 7 * 7, 256),  # 展平后的大小是128×7×7=6272
+                nn.ReLU(),
+                nn.Dropout(dropout_rate/2),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, num_classes)
+            )
+
+            # 初始化权重
+            self._initialize_weights()
+
+        '''网络初始化权重'''
+        def _initialize_weights(self):  
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, 0, 0.01)
+                    nn.init.constant_(m.bias, 0)
+        
+        def forward(self, x):
+            """前向传播"""
+            # 特征提取
+            x = self.features(x)
+            
+            # 展平
+            x = x.view(x.size(0), -1)
+            
+            # 分类
+            x = self.classifier(x)
+            
+            return x
+        
+        def get_feature_maps(self, x, layer_index=None):
+            """获取指定层的特征图（用于可视化）"""
+            features = []
+            
+            # 逐层提取特征
+            for i, layer in enumerate(self.features):
+                x = layer(x)
+                if isinstance(layer, nn.Conv2d):
+                    features.append(x.detach())
+            
+            if layer_index is not None:
+                return features[layer_index] if layer_index < len(features) else None
+            return features
+    
+    # 创建模型实例并查看架构
+    def create_and_examine_model():
+        """创建模型并查看其架构"""
+        print("\n" + "="*60)
+        print("模型创建与架构分析")
+        print("="*60)
+
+        # 创建模型
+        model = DigitRecognizerCNN(num_classes=10).to(device)
+        
+        # 打印模型架构
+        print("模型架构:")
+        print(model)
+        print()
+
+        # 计算参数量
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        print("参数量统计:")
+        print(f"  总参数量: {total_params:,}")
+        print(f"  可训练参数量: {trainable_params:,}")
+        print(f"  不可训练参数量: {total_params - trainable_params:,}")
+
+        # 计算模型大小（近似）
+        model_size_mb = total_params * 4 / (1024 * 1024)  # 假设每个参数4字节（float32）
+        print(f"  模型大小（近似）: {model_size_mb:.2f} MB")
+        
+        # 测试前向传播
+        print("\n测试前向传播...")
+        test_input = torch.randn(2, 1, 28, 28).to(device)  # 批次大小为2
+        output = model(test_input)
+        print(f"  输入形状: {test_input.shape}")
+        print(f"  输出形状: {output.shape}")
+        print(f"  输出示例: {output[0].detach().cpu().numpy()}")
+        
+        return model
+    
+    # 创建模型
+    model = create_and_examine_model()
+
+    def analyze_model_complexity(model, input_size=(1, 28, 28)):
+        """分析模型复杂度"""
+        print("\n" + "="*60)
+        print("模型复杂度分析")
+        print("="*60)
+    
+        # 手动计算每层的输出形状和参数量
+        print("逐层分析:")
+        print("-"*80)
+        print(f"{'层类型':<20} {'输出形状':<20} {'参数量':<15} {'计算量(MACs)':<15}")
+        print("-"*80)
+    
+        total_params = 0
+        total_macs = 0
+    
+        # 模拟前向传播来获取各层输出形状
+        x = torch.randn(1, *input_size).to(device)
+    
+        # 分析特征提取部分
+        for name, layer in model.features.named_children():
+            if isinstance(layer, nn.Conv2d):
+                # 计算输出形状
+                h_out = (x.shape[2] + 2*layer.padding[0] - layer.dilation[0] * 
+                        (layer.kernel_size[0] - 1) - 1) // layer.stride[0] + 1
+                w_out = (x.shape[3] + 2*layer.padding[1] - layer.dilation[1] * 
+                        (layer.kernel_size[1] - 1) - 1) // layer.stride[1] + 1
+            
+                # 计算参数量
+                params = (layer.in_channels * layer.out_channels * 
+                        layer.kernel_size[0] * layer.kernel_size[1])
+                if layer.bias is not None:
+                    params += layer.out_channels
+            
+                # 计算计算量（MACs：乘加操作）
+                macs = (h_out * w_out * layer.out_channels * layer.in_channels * 
+                    layer.kernel_size[0] * layer.kernel_size[1])
+            
+                print(f"{'卷积层':<20} {f'({x.shape[1]}, {h_out}, {w_out})':<20} "
+                    f"{params:,}<15 {macs:,}<15")
+            
+                total_params += params
+                total_macs += macs
+            
+            elif isinstance(layer, nn.MaxPool2d):
+            # 池化层没有参数
+                h_out = (x.shape[2] - layer.kernel_size) // layer.stride + 1
+                w_out = (x.shape[3] - layer.kernel_size) // layer.stride + 1
+                print(f"{'池化层':<20} {f'({x.shape[1]}, {h_out}, {w_out})':<20} "
+                    f"{0:<15} {0:<15}")
+        
+            elif isinstance(layer, nn.BatchNorm2d):
+                # BatchNorm参数量：2 * channels
+                params = 2 * layer.num_features
+                print(f"{'批归一化':<20} {str(x.shape):<20} "
+                    f"{params:,}<15 {0:<15}")
+                total_params += params
+            
+            elif isinstance(layer, nn.ReLU):
+                print(f"{'激活函数':<20} {str(x.shape):<20} "
+                    f"{0:<15} {0:<15}")
+        
+            # 更新x
+            x = layer(x)
+    
+        # 展平后的尺寸
+        flattened_size = x.numel()
+        print(f"{'展平':<20} {f'({flattened_size},)':<20} "
+            f"{0:<15} {0:<15}")
+    
+        # 分析分类器部分
+        x = x.view(1, -1)  # 展平
+        for name, layer in model.classifier.named_children():
+            if isinstance(layer, nn.Linear):
+                # 全连接层参数量
+                params = layer.in_features * layer.out_features
+                if layer.bias is not None:
+                    params += layer.out_features
+            
+                # 全连接层计算量
+                macs = layer.in_features * layer.out_features
+            
+                print(f"{'全连接层':<20} {f'({layer.out_features},)':<20} "
+                    f"{params:,}<15 {macs:,}<15")
+            
+                total_params += params
+                total_macs += macs
+            
+            elif isinstance(layer, nn.Dropout):
+                print(f"{'Dropout':<20} {str(x.shape):<20} "
+                    f"{0:<15} {0:<15}")
+                
+            elif isinstance(layer, nn.ReLU):
+                print(f"{'激活函数':<20} {str(x.shape):<20} "
+                    f"{0:<15} {0:<15}")
+        
+            x = layer(x)
+    
+        print("-"*80)
+        print(f"{'总计':<20} {'-':<20} "
+            f"{total_params:,}<15 {total_macs:,}<15")
+    
+        # 转换为更方便的单位
+        total_macs_g = total_macs / 1e9  # Giga MACs
+    
+        print(f"\n复杂度总结:")
+        print(f"  总参数量: {total_params:,}")
+        print(f"  总计算量: {total_macs_g:.2f} GMACs")
+        print(f"  模型大小: {total_params * 4 / (1024*1024):.2f} MB (float32)")
+    
+        # 与简单模型的比较
+        print(f"\n与简单模型的比较:")
+        print(f"  Logistic回归参数量: {28*28*10 + 10:,} (比CNN多{total_params/(28*28*10 + 10):.1f}倍)")
+        print(f"  全连接神经网络(1隐藏层): {28*28*128 + 128*10 + 128 + 10:,} (比CNN多{total_params/(28*28*128 + 128*10 + 128 + 10):.1f}倍)")
+    
+        return total_params, total_macs
+
+    # 分析模型复杂度
+    total_params, total_macs = analyze_model_complexity(model)
+
+
+    class ModelTrainer:
+        """模型训练器"""
+        
+        def __init__(self, model, device, learning_rate=0.001):
+            self.model = model   # 将传入的模型、设备和学习率保存为实例属性
+            self.device = device
+            self.learning_rate = learning_rate
+
+            # 损失函数：交叉熵损失（适用于多分类）
+            self.criterion = nn.CrossEntropyLoss()   # 适用于 多分类任务，输入是未归一化的 logits，输出是类别标签（整数），自动包含 softmax 和负对数似然计算
+
+            # 优化器：Adam（自适应学习率）
+            self.optimizer = optim.Adam(
+                model.parameters(),  # 优化器作用于模型的所有可训练参数
+                lr=learning_rate,
+                weight_decay=1e-5  # 添加 L2 正则化（权重衰减），防止过拟合
+            )
+
+            # 学习率调度器：使用 StepLR 调度器，在每经过 step_size=5 个 epoch 后，将学习率乘以 gamma=0.5，更稳定地收敛
+            self.scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer, 
+                step_size=5,      # 每5个epoch
+                gamma=0.5         # 学习率乘以0.5
+            )
+
+            # 记录训练历史
+            self.history = {
+                'train_loss': [], # 每个 epoch 的训练损失
+                'val_loss': [],   # 验证集上的损失
+                'train_acc': [],  # 训练集准确率
+                'val_acc': [],    # 验证集准确率
+                'learning_rates': []  # 每个 epoch 的当前学习率（可用于绘图分析）
+            }
+
+            # 最佳模型跟踪
+            self.best_val_acc = 0.0
+            self.best_model_state = None
+
+        def train_epoch(self, train_loader, epoch, num_epochs):
+            """训练一个epoch"""
+            self.model.train()
+            running_loss = 0.0
+            correct = 0
+            total = 0
+
+            # 进度条
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+
+            for batch_idx, (inputs, targets) in enumerate(pbar):
+                # 移将 inputs 和 targets 移动到指定的设备（如 GPU）上，以进行后续的计算。
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+
+                # 将 inputs 通过模型 self.model 进行前向传播，得到模型的输出 outputs
+                # 使用损失函数 self.criterion 计算 outputs 和 targets 之间的损失值 loss
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets)
+
+                # 调用 self.optimizer.zero_grad() 清除之前的梯度
+                # 调用 loss.backward() 进行反向传播，计算每个参数的梯度
+                self.optimizer.zero_grad()
+                loss.backward()
+
+                # 梯度裁剪（防止梯度爆炸）
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                # 更新参数
+                self.optimizer.step()
+
+                # 统计
+                # 累加当前批次的损失值 loss.item() 到 running_loss
+                # 获取 outputs 中每个样本的最大值的索引 predicted，作为预测结果
+                # 累加当前批次的样本数量到 total
+                # 比较 predicted 和 targets，统计预测正确的样本数量，并累加到 correct
+                running_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+
+                # 更新进度条
+                pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{100.*correct/total:.2f}%'
+                    })
+                
+             # 计算平均损失和准确率
+            epoch_loss = running_loss / len(train_loader)
+            epoch_acc = 100. * correct / total
+
+            return epoch_loss, epoch_acc
+        
+        def validate(self, val_loader):
+            """验证模型"""
+            self.model.eval() # 将模型设置为评估模式，这通常会关闭 dropout 和 batch normalization 等在训练时启用但在评估时不需要的层。
+            val_loss = 0.0
+            correct = 0
+            total = 0
+
+            with torch.no_grad():  # 禁用梯度计算可以节省内存并加速计算，因为验证过程中不需要反向传播
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+
+                    val_loss += loss.item()  # 将当前批次的损失值加到 val_loss 上
+                    _, predicted = outputs.max(1) # 找到每个样本输出的最大值的索引（即预测类别）
+                    total += targets.size(0) # 累计总样本数
+                    correct += predicted.eq(targets).sum().item() # 比较预测类别 predicted 和实际目标 targets，累计正确预测的数量
+
+            val_loss = val_loss / len(val_loader)
+            val_acc = 100. * correct / total
+
+            return val_loss, val_acc
+        
+        def train(self, train_loader, val_loader, num_epochs=1):
+            """完整训练过程"""
+            print(f"\n开始训练模型...")
+            print(f"设备: {self.device}")
+            print(f"优化器: Adam (lr={self.learning_rate})")
+            print(f"学习率调度: StepLR (step=5, gamma=0.5)")
+            print(f"正则化: L2 weight_decay=1e-5")
+            print(f"总epoch数: {num_epochs}")
+            print("="*60)
+            
+            start_time = time.time()
+
+            for epoch in range(num_epochs):
+                # 训练一个epoch
+                train_loss, train_acc = self.train_epoch(train_loader, epoch, num_epochs)
+                
+                # 验证
+                val_loss, val_acc = self.validate(val_loader)
+                
+                # 记录历史
+                self.history['train_loss'].append(train_loss)
+                self.history['train_acc'].append(train_acc)
+                self.history['val_loss'].append(val_loss)
+                self.history['val_acc'].append(val_acc)
+                self.history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+
+                # 保存最佳模型
+                if val_acc > self.best_val_acc:
+                    self.best_val_acc = val_acc
+                    self.best_model_state = self.model.state_dict().copy()
+
+                    # 保存模型到文件
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'val_acc': val_acc,
+                        'history': self.history
+                    }, 'best_digit_recognizer.pth')
+
+                # 更新学习率
+                self.scheduler.step()
+
+                # 打印epoch结果
+                print(f"\nEpoch {epoch+1}/{num_epochs} 完成:")
+                print(f"  训练损失: {train_loss:.4f}, 训练准确率: {train_acc:.2f}%")
+                print(f"  验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.2f}%")
+                print(f"  最佳验证准确率: {self.best_val_acc:.2f}%")
+                print(f"  当前学习率: {self.optimizer.param_groups[0]['lr']:.6f}")
+                print("-"*50)
+
+            # 训练完成
+            end_time = time.time()
+            training_time = end_time - start_time
+
+            print(f"\n训练完成!")
+            print(f"总训练时间: {training_time:.2f}秒")
+            print(f"平均每个epoch: {training_time/num_epochs:.2f}秒")
+            print(f"最佳验证准确率: {self.best_val_acc:.2f}%")
+
+            # 加载最佳模型
+            if self.best_model_state is not None:
+                self.model.load_state_dict(self.best_model_state)
+                print("已加载最佳模型权重")
+
+            return self.history
+        
+    # 创建训练器并开始训练
+    trainer = ModelTrainer(model, device, learning_rate=0.001)
+    history = trainer.train(train_loader, val_loader, num_epochs=1)
+
+
+    class TrainingVisualizer:
+        """训练过程可视化"""
+    
+    @staticmethod
+    def plot_training_history(history):
+        """绘制训练历史"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        epochs = range(1, len(history['train_loss']) + 1)
+
+        # 1. 损失曲线
+        ax1 = axes[0, 0]
+        ax1.plot(epochs, history['train_loss'], 'b-', linewidth=2, marker='o', label='训练损失')
+        ax1.plot(epochs, history['val_loss'], 'r-', linewidth=2, marker='s', label='验证损失')
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('损失', fontsize=12)
+        ax1.set_title('训练和验证损失曲线', fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 标记最佳epoch
+        best_epoch = np.argmin(history['val_loss'])  # 找到验证损失最小的 epoch 索引
+        ax1.axvline(x=best_epoch+1, color='g', linestyle='--', alpha=0.7)
+        ax1.text(best_epoch+1, max(history['val_loss'])*0.9, 
+                f'最佳epoch: {best_epoch+1}', ha='center', fontsize=10)
+        
+
+        # 2. 准确率曲线
+        ax2 = axes[0, 1]
+        ax2.plot(epochs, history['train_acc'], 'b-', linewidth=2, marker='o', label='训练准确率')
+        ax2.plot(epochs, history['val_acc'], 'r-', linewidth=2, marker='s', label='验证准确率')
+        ax2.set_xlabel('Epoch', fontsize=12)
+        ax2.set_ylabel('准确率 (%)', fontsize=12)
+        ax2.set_title('训练和验证准确率曲线', fontsize=14, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 标记最佳准确率
+        best_acc_epoch = np.argmax(history['val_acc'])
+        best_acc = history['val_acc'][best_acc_epoch]
+        ax2.axvline(x=best_acc_epoch+1, color='g', linestyle='--', alpha=0.7)
+        ax2.text(best_acc_epoch+1, min(history['val_acc']), 
+                f'最佳: {best_acc:.2f}%', ha='center', fontsize=10)
+        
+
+        # 3. 学习率变化
+        ax3 = axes[1, 0]
+        ax3.plot(epochs, history['learning_rates'], 'purple-', linewidth=2, marker='^')
+        ax3.set_xlabel('Epoch', fontsize=12)
+        ax3.set_ylabel('学习率', fontsize=12)
+        ax3.set_title('学习率变化曲线', fontsize=14, fontweight='bold')
+        ax3.set_yscale('log')  # 对数坐标
+        ax3.grid(True, alpha=0.3)
+        
+        # 添加学习率值标注
+        for i, lr in enumerate(history['learning_rates']):
+            ax3.text(i+1, lr*1.2, f'{lr:.1e}', ha='center', fontsize=9)
+
+        
+        # 4. 训练/验证差距
+        ax4 = axes[1, 1]
+
+        # 计算训练集准确率 (history['train_acc']) 和验证集准确率 (history['val_acc']) 之间的差距
+        train_val_gap = [train - val for train, val in zip(history['train_acc'], history['val_acc'])] # 
+        ax4.plot(epochs, train_val_gap, 'orange-', linewidth=2, marker='d') #
+        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+        ax4.fill_between(epochs, 0, train_val_gap, where=np.array(train_val_gap)>=0, 
+                        alpha=0.3, color='red', label='过拟合风险')
+        ax4.fill_between(epochs, 0, train_val_gap, where=np.array(train_val_gap)<=0, 
+                        alpha=0.3, color='blue', label='欠拟合或数据问题')
+        ax4.set_xlabel('Epoch', fontsize=12)
+        ax4.set_ylabel('训练-验证差距 (%)', fontsize=12)
+        ax4.set_title('训练-验证准确率差距', fontsize=14, fontweight='bold')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+
+        # 分析训练效果
+        print("\n训练效果分析:")
+        print(f"  最终训练准确率: {history['train_acc'][-1]:.2f}%")
+        print(f"  最终验证准确率: {history['val_acc'][-1]:.2f}%")
+        print(f"  最佳验证准确率: {best_acc:.2f}% (Epoch {best_acc_epoch+1})")
+        print(f"  最终训练-验证差距: {train_val_gap[-1]:.2f}%")
+        
+        if train_val_gap[-1] > 5:
+            print("  ⚠️ 警告: 训练-验证差距较大，可能存在过拟合")
+        elif train_val_gap[-1] < -2:
+            print("  ⚠️ 警告: 验证准确率高于训练准确率，可能有数据泄露问题")
+        else:
+            print("  ✅ 训练-验证差距正常")
+
+    @staticmethod
+    def visualize_feature_maps(model, test_loader, device):
+        """可视化特征图"""
+        model.eval()
+        
+        # 获取一个测试样本
+        data_iter = iter(test_loader) # 将 test_loader（一个数据加载器）转换为迭代器
+        images, labels = next(data_iter) # 从迭代器中获取一个批次的数据，包括图像（images）和对应的标签（labels）
+        
+        # 选择前几个样本
+        num_samples = 4
+        fig, axes = plt.subplots(num_samples, 6, figsize=(15, 10))
+
+        for i in range(num_samples):
+            image = images[i].unsqueeze(0).to(device) # 选择第 i 个图像，使用 unsqueeze(0) 增加一个批量维度（使其形状为 [1, C, H, W]），然后将其移动到指定的设备（如 GPU）
+            label = labels[i].item() # 获取第 i 个图像的标签，并将其转换为 Python 标量
+            
+            # 获取各层特征图
+            with torch.no_grad(): # 禁用梯度计算，用于推理阶段，可以节省内存和计算资源
+                feature_maps = model.get_feature_maps(image) # 调用模型的 get_feature_maps 方法，获取输入图像在模型各层的特征图
+            
+            # 原始图像
+            axes[i, 0].imshow(images[i].squeeze(), cmap='gray') # 在子图的第一列展示原始图像。images[i].squeeze() 去除图像的批量维度和通道维度（假设是灰度图像）
+            axes[i, 0].set_title(f'原始图像\n标签: {label}')
+            axes[i, 0].axis('off') # 关闭该子图的坐标轴显示
+
+            # 显示每层的特征图（选择每个层的第一个通道）
+            # 是存储CNN各层特征图的列表（每层一个元素，元素是该层提取的特征图）
+            # 是当前处理的层的索引（从0开始）
+            for layer_idx in range(min(5, len(feature_maps))):  
+                feature_map = feature_maps[layer_idx][0].cpu().numpy() 
+                # 取第layer_idx层的特征图（通常是PyTorch Tensor，形状为 [batch_size, channels, height, width] 或 [batch_size, height, width]
+                # [0]：假设输入是单样本（batch size=1），取batch中的第一个样本（去掉batch维度）
+                # .cpu().numpy()：将GPU上的Tensor移到CPU，并转为NumPy数组
+                
+                # 选择第一个通道显示
+                if len(feature_map.shape) == 3:  # 多通道特征图
+                    axes[i, layer_idx+1].imshow(feature_map[0], cmap='viridis')
+                else:  # 单通道特征图
+                    axes[i, layer_idx+1].imshow(feature_map, cmap='viridis')
+                
+                axes[i, layer_idx+1].set_title(f'层 {layer_idx+1}\n{feature_map.shape}')
+                axes[i, layer_idx+1].axis('off')
+
+            plt.suptitle('CNN特征图可视化', fontsize=16, fontweight='bold', y=1.02)
+            plt.tight_layout()
+            plt.show()
+            
+            print("\n特征图分析:")
+            print("  层1: 边缘检测（各种方向的边缘）")
+            print("  层2: 纹理和简单形状")
+            print("  层3: 部件组合")
+            print("  层4-5: 高级特征（数字的抽象表示）")
+
+        # 可视化训练过程
+        print("\n" + "="*60)
+        print("训练过程可视化")
+        print("="*60)
+
+        # 1. 绘制训练历史
+        # TrainingVisualizer是一个类，用于训练过程的可视化
+        # 是该类的一个方法，用于绘制训练历史
+        TrainingVisualizer.plot_training_history(history)
+
+        # 2. 可视化特征图
+        # visualize_feature_maps 是 TrainingVisualizer 类的另一个方法，用于可视化特征图
+        TrainingVisualizer.visualize_feature_maps(model, test_loader, device)
+
+    class ModelEvaluator:
+        """模型评估器"""
+    
+        def __init__(self, model, device):
+            self.model = model  # 将传入的模型保存为实例变量，方便后续调用
+            self.device = device
+            self.model.eval()  # 设置为评估模式 评估模式下，模型的行为会与训练模式不同（例如：Dropout层不再随机丢弃神经元、BatchNorm层使用整个训练集的均值/方差，确保评估结果稳定可靠）
+
+        def evaluate_on_test(self, test_loader):
+            """在测试集上评估模型"""
+            print("\n" + "="*60)
+            print("测试集评估")
+            print("="*60)
+            
+            test_loss = 0.0
+            all_preds = []
+            all_labels = []
+            all_probabilities = []
+
+            # 使用测试模式
+            with torch.no_grad(): #torch.no_grad()禁用梯度计算
+
+                # 每次迭代取出一个批次（batch）的输入数据（inputs）和对应标签（labels）
+                for inputs, labels in test_loader:
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+                    
+                    # 前向传播
+                    outputs = self.model(inputs)  # 将输入数据喂入模型，得到原始输出（logits，未归一化的预测值）
+                    probabilities = F.softmax(outputs, dim=1) # 用softmax函数将原始输出转换为概率分布（dim=1表示在类别维度上归一化，使每一行（一个样本）的概率和为1）
+                    
+                    # 计算损失
+                    loss = F.cross_entropy(outputs, labels) # 使用交叉熵损失函数计算当前批次的损失（输入是原始输出outputs和真实标签labels，交叉熵会自动处理logits到概率的转换）
+                    test_loss += loss.item() # 累加当前批次的损失值（loss.item()将标量张量转为Python数值）
+                    
+                    # 获取预测结果
+                    _, preds = torch.max(outputs, 1) # 对原始输出outputs，在类别维度（dim=1）取最大值，返回最大值的索引（即预测的类别标签）。这里_忽略最大值本身，只保留预测类别（preds）
+                    
+                    # 收集所有预测和标签
+                    all_preds.extend(preds.cpu().numpy()) # 将当前批次的预测标签移到CPU并转为numpy数组，追加到all_preds列表
+                    all_labels.extend(labels.cpu().numpy()) # 将当前批次的真实标签移到CPU并转为numpy数组，追加到all_labels列表
+                    all_probabilities.extend(probabilities.cpu().numpy()) # 将当前批次的概率移到CPU并转为numpy数组，追加到all_probabilities列表
+
+                    # 计算平均损失
+                    test_loss = test_loss / len(test_loader)
+                    
+                # 计算准确率
+                all_preds = np.array(all_preds) # 将收集的预测标签列表转为numpy数组
+                all_labels = np.array(all_labels) # 将收集的真实标签列表转为numpy数组
+                accuracy = np.mean(all_preds == all_labels) * 100 # 通过all_preds == all_labels得到布尔数组（正确为True，错误为False），np.mean计算平均值（即正确预测的比例），再乘以100转换为百分比
+                
+                print(f"测试损失: {test_loss:.4f}")
+                print(f"测试准确率: {accuracy:.2f}%")
+                
+                return {
+                    'loss': test_loss,
+                    'accuracy': accuracy,
+                    'predictions': all_preds,
+                    'labels': all_labels,
+                    'probabilities': np.array(all_probabilities)
+                }
+            
+        def confusion_matrix_analysis(self, predictions, labels):    # sklearn.metrics.confusion_matrix 是 scikit-learn 库中用于计算分类模型混淆矩阵的函数
+            """混淆矩阵分析"""
+            print("\n混淆矩阵分析:")
+            print("-"*40)
+            
+            # 计算混淆矩阵
+            cm = confusion_matrix(labels, predictions)
+            
+            # 绘制混淆矩阵
+            plt.figure(figsize=(10, 8))
+
+            # 用seaborn的热力图绘制混淆矩阵
+            # annot=True：在热力图单元格内显示数值
+            # fmt='d'：数值格式为整数（混淆矩阵元素是整数计数）
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=range(10), yticklabels=range(10)) # x轴（预测标签）、y轴（真实标签）的标签设置为0-9（适用于10分类任务，如手写数字识别）
+            plt.xlabel('预测标签', fontsize=12)
+            plt.ylabel('真实标签', fontsize=12)
+            plt.title('混淆矩阵', fontsize=14, fontweight='bold')
+            plt.show()
+
+            # 计算每个类别的指标
+            print("\n每个数字的详细性能:")
+            print("-"*60)
+            print(f"{'数字':<8} {'准确率':<10} {'召回率':<10} {'F1分数':<10} {'支持数':<10}")
+            print("-"*60)
+                
+            # 从混淆矩阵计算每个类别的指标
+            for i in range(10):
+                # 真正例、假正例、假负例
+                tp = cm[i, i]
+                fp = cm[:, i].sum() - tp
+                fn = cm[i, :].sum() - tp
+                tn = cm.sum() - tp - fp - fn
+                
+                # 计算指标
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0 # 精确率
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0 # 召回率
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                support = cm[i, :].sum()
+                accuracy_class = tp / support if support > 0 else 0
+                
+                print(f"{i:<8} {accuracy_class*100:>7.2f}% {recall*100:>9.2f}% "
+                    f"{f1*100:>9.2f}% {support:>10}")
+                    
+            # 整体分类报告
+            print("\n" + "="*60)
+            print("详细分类报告:")
+            print("="*60)
+            
+            # scikit-learn 库的classification_report 函数
+            report = classification_report(labels, predictions, 
+                                        target_names=[str(i) for i in range(10)]) # 类别名列表（这里生成 ['0', '1', ..., '9']，对应10个类别
+            print(report)
+            
+            # 找出最容易混淆的数字对
+            confusion_pairs = []  # 存储“实际数字i、被误识别成的数字j、混淆次数”的元组
+
+            # 这部分通过双层循环遍历混淆矩阵（cm 是一个10×10的矩阵，行i代表实际数字，列j代表预测数字，cm[i,j]代表“实际为i却被预测成j”的样本数）
+            # 只有实际数字≠预测数字且混淆次数>0的情况，才会被记录为一个“混淆数字对”（元组形式：(实际数字i, 被误识别成的数字j, 混淆次数)
+            for i in range(10): # i 遍历0-9（实际数字类别）
+                for j in range(10): # j 遍历0-9（预测数字类别）
+                    if i != j and cm[i, j] > 0:  # 实际≠预测（混淆场景） + 混淆次数>0（有混淆发生）
+                        confusion_pairs.append((i, j, cm[i, j]))  # 存储(i, j, 混淆次数)
+                
+            # 按混淆次数排序
+            # 通过sort方法，以每个元组的第3个元素（x[2]，即“混淆次数”）为关键字，降序排序（reverse=True）
+            confusion_pairs.sort(key=lambda x: x[2], reverse=True)
+            
+            print("\n最容易混淆的数字对（前5个）:")
+            for i, j, count in confusion_pairs[:5]:
+                print(f"  {i} 被误识别为 {j}: {count} 次")
+            
+            return cm
+            
+        def analyze_errors(self, test_loader, predictions, labels, probabilities, num_errors=10):
+            """分析错误预测"""
+            print("\n" + "="*60)
+            print("错误分析")
+            print("="*60)
+            
+            # 找出所有错误预测的索引
+            # 使用 np.where 函数筛选出预测结果与真实标签不相等的索引（predictions != labels）
+            # [0] 表示获取第一维的索引（因为 np.where 返回的是元组，第一维是满足条件的索引数组）
+            error_indices = np.where(predictions != labels)[0] 
+            
+            if len(error_indices) == 0:
+                print("没有发现错误预测！")
+                return
+            
+            print(f"总错误数: {len(error_indices)}")
+            print(f"错误率: {len(error_indices)/len(labels)*100:.2f}%")
+
+            # 随机选择一些错误进行可视化
+            # 从所有错误索引中随机选择一部分样本（默认 10 个，但如果总错误数不足 10 个，则选择所有错误样本）
+            # replace=False表示不放回抽样（避免重复选择同一个错误样本）
+            selected_errors = np.random.choice(error_indices, 
+                                            size=min(num_errors, len(error_indices)), 
+                                            replace=False)
+            
+            # 可视化错误预测
+            fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+            axes = axes.ravel()
+            
+            # 获取原始图像数据（需要重新加载测试集）
+            all_images = []
+            all_true_labels = []
+            with torch.no_grad():
+                for inputs, batch_labels in test_loader:
+                    all_images.append(inputs.cpu().numpy())
+                    all_true_labels.append(batch_labels.cpu().numpy())
+            
+            all_images = np.concatenate(all_images, axis=0)  # 将 all_images 列表中的所有图像数据沿着第一个轴（即批次轴）拼接成一个大的 NumPy 数组
+            all_true_labels = np.concatenate(all_true_labels, axis=0) # 将 all_true_labels 列表中的所有标签沿着第一个轴拼接成一个大的 NumPy 数组
+
+            # enumerate 是 Python 中的一个内置函数，用于在遍历可迭代对象（如列表、元组等）时，同时获取元素的索引和值
+            # 如果 selected_errors 是一个列表 [1, 2, 3]，那么 enumerate(selected_errors) 会产生 (0, 1)、(1, 2) 和 (2, 3)
+            for idx, error_idx in enumerate(selected_errors):
+                if idx >= 10:  # 只显示前10个
+                    break
+                    
+                image = all_images[error_idx].squeeze() # squeeze() 方法去除多余的维度（例如，将形状为 (1, 28, 28) 的图像转换为 (28, 28)
+                true_label = all_true_labels[error_idx]
+                pred_label = predictions[error_idx]
+                prob = probabilities[error_idx][pred_label] # 获取模型预测当前错误样本为 pred_label 类别的概率
+                
+                axes[idx].imshow(image, cmap='gray')
+                axes[idx].set_title(f'真实: {true_label}, 预测: {pred_label}\n置信度: {prob:.2%}')
+                axes[idx].axis('off')
+
+                # 用红色边框标记错误
+                for spine in axes[idx].spines.values():
+                    spine.set_color('red')
+                    spine.set_linewidth(3)
+            
+            plt.suptitle('错误预测示例', fontsize=16, fontweight='bold', y=1.05)
+            plt.tight_layout()
+            plt.show()
+
+            # 分析错误类型
+            print("\n错误类型分析:")
+            error_types = {}
+            for i in error_indices:
+                true_label = labels[i]
+                pred_label = predictions[i]
+                key = f"{true_label}→{pred_label}"
+                error_types[key] = error_types.get(key, 0) + 1
+
+            
+            # 按错误次数排序 sorted() 是 Python 内置的一个函数，用于对可迭代对象（如列表、元组、字典等）进行排序，并返回一个新的已排序的列表
+            sorted_errors = sorted(error_types.items(), key=lambda x: x[1], reverse=True)
+            
+            print(f"{'真实→预测':<12} {'次数':<8} {'占比':<10}")
+            print("-"*40)
+            for error_type, count in sorted_errors[:10]:  # 显示前10个
+                percentage = count / len(error_indices) * 100
+                print(f"{error_type:<12} {count:<8} {percentage:>7.2f}%")
+
+        def confidence_analysis(self, probabilities, labels, predictions):
+            """置信度分析"""
+            print("\n" + "="*60)
+            print("置信度分析")
+            print("="*60)
+
+            # 计算每个预测的置信度（最高概率）
+            confidences = np.max(probabilities, axis=1)  # 沿行（axis=1）取每行最大值，得到一维数组 confidences，长度等于样本数，每个元素是对应样本的“置信度”（最高预测概率）
+            
+            # 正确预测和错误预测的置信度
+            # 比较 predictions（预测标签）和 labels（真实标签），得到布尔数组 correct_mask（形状与 predictions/labels 一致）
+            # True 表示“该样本预测正确”，False 表示“预测错误”
+            correct_mask = (predictions == labels) 
+            correct_confidences = confidences[correct_mask] # 用 correct_mask 筛选 confidences，得到所有预测正确样本的置信度数组
+            wrong_confidences = confidences[~correct_mask] # ~correct_mask 是布尔数组的“取反”（True 变 False，反之亦然），筛选出所有预测错误样本的置信度数组
+            
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+            # 1. 置信度分布直方图
+            axes[0].hist(correct_confidences, bins=30, alpha=0.7, 
+                        label='正确预测', color='green')
+            axes[0].hist(wrong_confidences, bins=30, alpha=0.7, 
+                        label='错误预测', color='red')
+            axes[0].set_xlabel('置信度', fontsize=12)
+            axes[0].set_ylabel('样本数量', fontsize=12)
+            axes[0].set_title('置信度分布', fontsize=14, fontweight='bold')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            # 2. 准确率随置信度的变化
+            # np.linspace(0, 1, 11): 生成 [0, 0.1, 0.2, ..., 1.0] 共11个等间距的数，将 [0, 1] 区间划分为 10个子区间（如 [0, 0.1), [0.1, 0.2), ..., [0.9, 1.0]）
+            bins = np.linspace(0, 1, 11) 
+            bin_centers = (bins[:-1] + bins[1:]) / 2 # 计算每个子区间的中点值（用于后续绘图时的横坐标）
+            accuracies = []
+            
+            for i in range(len(bins)-1):
+                mask = (confidences >= bins[i]) & (confidences < bins[i+1]) # 生成布尔掩码，筛选出置信度（confidences 数组）落在当前子区间 [bins[i], bins[i+1]) 内的样本
+                if mask.sum() > 0:
+                    bin_accuracy = np.mean(predictions[mask] == labels[mask]) * 100
+                    accuracies.append(bin_accuracy)
+                else:
+                    accuracies.append(0)
+
+            axes[1].plot(bin_centers, accuracies, 'b-o', linewidth=2)
+            axes[1].set_xlabel('置信度区间', fontsize=12)
+            axes[1].set_ylabel('准确率 (%)', fontsize=12)
+            axes[1].set_title('准确率 vs 置信度', fontsize=14, fontweight='bold')
+            axes[1].grid(True, alpha=0.3)
+
+            # 3. 可靠性图（校准曲线），用于评估模型“预测概率是否可信”
+            from sklearn.calibration import calibration_curve # calibration_curve 函数用于计算“校准曲线”的数据点（预测概率的平均值、对应的真实正例率）
+            
+            # 通过真实标签 labels 和模型预测的类别标签 predictions 的布尔比较，生成一个指示变量（可理解为“预测正确的二元标签”：预测正确为 True（1），错误为 False（0））。这是校准曲线需要的真实二元标签（y_true）
+            # confidences：模型预测的概率（置信度），例如二分类任务中预测样本属于正类的概率
+            # 将预测概率划分为 10 个区间（“桶”），函数会对每个桶内的数据计算统计量
+            # prob_true：每个桶内真实正例的比例（fraction of positives），即该桶内“预测正确”的样本占比
+            # prob_pred：每个桶内预测概率的平均值（mean predicted probability）
+            
+            prob_true, prob_pred = calibration_curve(labels == predictions, 
+                                                    confidences, n_bins=10) 
+            
+            axes[2].plot(prob_pred, prob_true, 's-', linewidth=2, label='模型')
+            axes[2].plot([0, 1], [0, 1], 'k--', label='完美校准')
+            axes[2].set_xlabel('预测置信度', fontsize=12)
+            axes[2].set_ylabel('真实准确率', fontsize=12)
+            axes[2].set_title('模型校准曲线', fontsize=14, fontweight='bold')
+            axes[2].legend()
+            axes[2].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+
+            # 统计信息
+            print(f"平均置信度: {confidences.mean():.3f}")
+            print(f"正确预测的平均置信度: {correct_confidences.mean():.3f}")
+            print(f"错误预测的平均置信度: {wrong_confidences.mean():.3f}")
+            
+            # 计算预期校准误差（ECE）
+            ece = 0
+            for i in range(len(bins)-1):
+                mask = (confidences >= bins[i]) & (confidences < bins[i+1])
+                if mask.sum() > 0:
+                    bin_accuracy = np.mean(predictions[mask] == labels[mask])
+                    bin_confidence = confidences[mask].mean()
+                    bin_weight = mask.sum() / len(confidences)
+                    ece += bin_weight * abs(bin_accuracy - bin_confidence)
+            
+            print(f"预期校准误差（ECE）: {ece:.4f}")
+
+            if ece < 0.02:
+                print("✅ 模型校准良好")
+            elif ece < 0.05:
+                print("⚠️ 模型校准一般")
+            else:
+                print("❌ 模型校准较差，可能过度自信")
+
+    # 创建评估器并进行全面评估
+    evaluator = ModelEvaluator(model, device)
+
+    # 1. 测试集评估
+    test_results = evaluator.evaluate_on_test(test_loader)
+
+    # 2. 混淆矩阵分析
+    cm = evaluator.confusion_matrix_analysis(
+        test_results['predictions'], 
+        test_results['labels']
+    )
+
+    # 3. 错误分析
+    evaluator.analyze_errors(
+        test_loader,
+        test_results['predictions'],
+        test_results['labels'],
+        test_results['probabilities'],
+        num_errors=10
+    )
+
+    # 4. 置信度分析
+    evaluator.confidence_analysis(
+        test_results['probabilities'],
+        test_results['labels'],
+        test_results['predictions']
+    )
+
+
+    def benchmark_comparison():
+        """与其他方法和基准对比"""
+        print("\n" + "="*60)
+        print("性能基准对比")
+        print("="*60)
+
+        # 历史上的MNIST基准
+        benchmarks = [
+            {"方法": "人类识别", "年份": "-", "错误率": "0.2%", "参数量": "-", "说明": "人类平均错误率"},
+            {"方法": "线性分类器", "年份": "1998", "错误率": "12.0%", "参数量": "7,850", "说明": "最简单的基准"},
+            {"方法": "K近邻", "年份": "1998", "错误率": "5.0%", "参数量": "-", "说明": "传统机器学习方法"},
+            {"方法": "SVM", "年份": "1998", "错误率": "1.4%", "参数量": "-", "说明": "支持向量机"},
+            {"方法": "随机森林", "年份": "2000", "错误率": "3.0%", "参数量": "-", "说明": "集成方法"},
+            {"方法": "LeNet-5", "年份": "1998", "错误率": "0.8%", "参数量": "60,000", "说明": "第一个成功的CNN"},
+            {"方法": "本模型", "年份": "2023", "错误率": f"{100-test_results['accuracy']:.2f}%", 
+            "参数量": f"{total_params:,}", "说明": "本项目实现的CNN"},
+            {"方法": "ResNet", "年份": "2015", "错误率": "0.21%", "参数量": "1,700,000", "说明": "现代深度残差网络"},
+            {"方法": "最佳记录", "年份": "2020", "错误率": "0.17%", "参数量": "-", "说明": "当前最佳记录"},
+        ]
+
+        # 创建DataFrame来存储基准测试结果，并 可视化不同方法的错误率对比图
+        df_benchmarks = pd.DataFrame(benchmarks)
+        print(df_benchmarks.to_string(index=False))
+        
+        # 可视化对比
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        # 子图1：错误率对比
+        methods = df_benchmarks["方法"].tolist()
+        error_rates = []
+        for err in df_benchmarks["错误率"].tolist():
+            if err.endswith("%"):             # err.endswith("%")：判断是否以 % 结尾
+                error_rates.append(float(err[:-1]))  # float(err[:-1])：去掉最后的 %，转为浮点数
+            else:
+                error_rates.append(float(err))
+        
+        colors = ['lightblue' if m != '本模型' else 'red' for m in methods]
+        
+        axes[0].barh(methods, error_rates, color=colors)  # 绘制水平柱状图（y 轴是方法名，x 轴是错误率）
+        axes[0].set_xlabel('错误率 (%)', fontsize=12)
+        axes[0].set_title('不同方法的错误率对比', fontsize=14, fontweight='bold')
+        axes[0].invert_yaxis()  # 最高的在顶部
+        axes[0].grid(True, alpha=0.3, axis='x')
+
+        # 添加数值标签
+        for i, v in enumerate(error_rates):
+            axes[0].text(v + 0.1, i, f'{v:.2f}%', va='center')
+
+        # 子图2：参数量对比（对数坐标）
+        param_counts = []
+        for param in df_benchmarks["参数量"].tolist():
+            if param == "-":
+                param_counts.append(1)  # 为缺失值设置最小值
+            else:
+                param_counts.append(int(param.replace(',', '')))
+
+        axes[1].barh(methods, param_counts, color=colors)
+        axes[1].set_xlabel('参数量 (对数坐标)', fontsize=12)
+        axes[1].set_title('不同方法的参数量对比', fontsize=14, fontweight='bold')
+        axes[1].set_xscale('log')  # 对数坐标
+        axes[1].invert_yaxis()
+        axes[1].grid(True, alpha=0.3, axis='x')
+        
+        plt.tight_layout()
+        plt.show()
+
+        # 分析本模型的优劣
+        print("\n本模型分析:")
+        print(f"  准确率: {test_results['accuracy']:.2f}%")
+        print(f"  错误率: {100-test_results['accuracy']:.2f}%")
+        print(f"  参数量: {total_params:,}")
+
+        # 与LeNet-5对比
+        lenet5_error = 0.8
+        our_error = 100 - test_results['accuracy']
+        
+        if our_error < lenet5_error:
+            improvement = (lenet5_error - our_error) / lenet5_error * 100
+            print(f"  与LeNet-5相比: 错误率降低 {improvement:.1f}%")
+        else:
+            print(f"  与LeNet-5相比: 性能稍差，但参数量更少")
+
+        # 计算效率指标
+        print(f"\n效率指标:")
+        print(f"  每百万参数准确率: {test_results['accuracy'] / (total_params/1e6):.2f}% per M params")
+        print(f"  参数效率: {test_results['accuracy'] / total_params * 1e6:.4f}")
+
+    # 运行基准对比
+    benchmark_comparison()
+
+
+    class ModelManager:
+        """模型管理器：负责保存、加载和管理模型"""
+        
+        @staticmethod
+        # model: PyTorch 模型对象
+        # optimizer: 优化器对象
+        # history: 训练过程中的历史记录
+        # filepath: 保存路径
+        def save_model(model, optimizer, history, filepath='digit_recognizer_full.pth'):
+            """保存完整模型"""
+            checkpoint = {
+                'model_state_dict': model.state_dict(),   # 'model_state_dict'	模型参数（权重）的字典，可恢复模型结构和参数
+                'optimizer_state_dict': optimizer.state_dict(), # 'optimizer_state_dict'	优化器的状态（如动量、学习率等），用于恢复训练状态。
+                'history': history, # 'history'	训练过程中的指标（如 loss、acc），便于后续分析。
+                'model_architecture': str(model), # 'model_architecture'模型结构的字符串表示（如 str(model)），可用于记录模型结构。
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), # 'timestamp'保存时间戳，方便追踪版本。
+                'test_accuracy': test_results['accuracy'] if 'test_results' in globals() else None # 'test_accuracy'测试集上的准确率（如果存在），否则为 None。
+            }
+            
+            torch.save(checkpoint, filepath)
+            print(f"模型已保存到: {filepath}")
+            print(f"文件大小: {os.path.getsize(filepath) / 1024:.1f} KB")
+
+        @staticmethod
+        def load_model(filepath, model_class=DigitRecognizerCNN, device='cpu'):
+            """加载模型"""
+            if not os.path.exists(filepath):  # os.path.exists() 检查文件路径是否存在
+                raise FileNotFoundError(f"模型文件不存在: {filepath}")
+            
+            checkpoint = torch.load(filepath,weights_only=False,map_location=device) # map_location=device：将模型数据映射到指定设备（如 "cpu" 或 "cuda"），避免因设备不匹配导致错误。
+        
+            
+            # 创建模型实例
+            model = model_class().to(device) # model_class()：实例化传入的模型类（如 DigitRecognizerCNN），得到一个模型对象，.to(device)：将模型移到指定设备（CPU/GPU）
+            model.load_state_dict(checkpoint['model_state_dict']) # load_state_dict(...)：从 checkpoint 的 "model_state_dict" 键中取出模型参数字典，并加载到实例化的模型中，完成模型权重的恢复。
+            
+            print(f"模型已加载: {filepath}")
+            print(f"保存时间: {checkpoint.get('timestamp', '未知')}")
+            print(f"测试准确率: {checkpoint.get('test_accuracy', '未知')}")
+            
+            return model, checkpoint
+        
+        @staticmethod
+        def export_to_onnx(model, input_size=(1, 1, 28, 28), filepath='digit_recognizer.onnx'):
+            """导出为ONNX格式（便于跨平台部署）"""
+
+            # 创建示例输使用 torch.randn() 创建一个随机张量作为“虚拟输入”（dummy input），其形状与 input_size 一致
+            # 这个 dummy_input 是 PyTorch 导出 ONNX 所必需的，因为 ONNX 需要了解模型的输入结构
+            dummy_input = torch.randn(*input_size)
+            
+            # 导出模型
+            torch.onnx.export(
+                model, # 待导出的 PyTorch 模型
+                dummy_input, # 示例输入数据，用于推断模型结构
+                filepath, # 输出文件路径
+                export_params=True, # 是否导出模型参数（权重），通常设为 True
+                opset_version=11, # 使用 ONNX 的操作符版本（v11 支持大多数常见操作）
+                do_constant_folding=True, # 是否进行常量折叠优化（提前计算可确定的节点）
+                input_names=['input'], # 给输入张量命名
+                output_names=['output'], # 给输出张量命名
+                dynamic_axes={             # 设置动态轴，允许批大小（batch size）变化
+                    'input': {0: 'batch_size'},
+                    'output': {0: 'batch_size'}
+            }
+        )
+            
+            print(f"模型已导出为ONNX格式: {filepath}")
+            print(f"输入形状: {input_size}")
+            print(f"输出形状: (batch_size, 10)")
+
+        @staticmethod
+        def save_for_production(model, filepath='digit_recognizer_production.pt'):
+            """保存为生产环境使用的模型（只包含推理所需）"""
+            # 只保存模型状态字典
+            torch.save(model.state_dict(), filepath)
+            print(f"生产模型已保存: {filepath}")
+            print(f"文件大小: {os.path.getsize(filepath) / 1024:.1f} KB")
+    # 保存模型
+    print("\n" + "="*60)
+    print("模型保存")
+    print("="*60)
+
+    # 1. 保存完整模型（包含训练状态）
+    ModelManager.save_model(model, trainer.optimizer, history, 'digit_recognizer_full.pth')
+
+    # 2. 保存生产模型（只包含权重）
+    ModelManager.save_for_production(model, 'digit_recognizer_production.pt')
+
+    # 3. 导出为ONNX格式（可选）
+    try:
+        ModelManager.export_to_onnx(model, input_size=(1, 1, 28, 28), filepath='digit_recognizer.onnx')
+    except Exception as e:
+        print(f"ONNX导出失败: {e}")
+
+    # 演示加载模型
+    print("\n" + "="*60)
+    print("模型加载演示")
+    print("="*60)
+
+    # 加载模型，loaded_model实际用于推理的模型对象；
+    loaded_model, checkpoint = ModelManager.load_model('digit_recognizer_full.pth', device=device)
+    loaded_model.eval()
+
+    # 验证加载的模型
+    print("\n验证加载的模型...")
+    test_input = torch.randn(1, 1, 28, 28).to(device)  # 生成随机张量：形状为 [1, 1, 28, 28]（1 批次、1 通道、28x28 高宽），移到指定设备
+    with torch.no_grad():
+        output = loaded_model(test_input) 
+
+        # 模型的原始输出 output 是logits（未归一化的预测值），形状为 [1, 类别数]（如 MNIST 有 10 个类别，故形状为 [1, 10]）；
+        # F.softmax(..., dim=1) 沿类别维度（dim=1，即 10 个类别的分数）做 Softmax 转换，将 logits 变为概率分布（每个类别的概率和为 1）
+        probabilities = F.softmax(output, dim=1) 
+
+        # probabilities 是形状为 [1, 类别数] 的概率矩阵
+        # argmax(dim=1) 沿类别维度找到概率最高的类别索引（如 MNIST 中 0~9 对应索引 0~9），返回形状为 [1] 的张量
+        pred = torch.argmax(probabilities, dim=1)
+        
+    print(f"输入形状: {test_input.shape}")
+    print(f"输出形状: {output.shape}")
+    print(f"预测结果: {pred.item()}") # pred.item() 将标量张量转为 Python 原生数字（方便打印）
+
+    # probabilities[0]：取出批次中的第一个样本（即唯一样本）
+    # # 将张量从 GPU（若有）移到 CPU 并转为 NumPy 数组
+    print(f"概率分布: {probabilities[0].cpu().numpy().round(3)}") 
+
+    class DigitRecognizerAPI:
+        """手写数字识别API"""
+        
+        def __init__(self, model_path='digit_recognizer_production.pt', device='cpu'):
+            self.device = device
+            
+            # 加载模型
+            self.model = DigitRecognizerCNN().to(device)
+            self.model.load_state_dict(torch.load(model_path, map_location=device))
+            self.model.eval()
+            
+            # 数据预处理（与训练时一致）
+            self.transform = transforms.Compose([
+                transforms.ToTensor(), # 将输入的PIL图像或numpy数组转换为PyTorch张量（Tensor），并自动将像素值归一化到[0, 1]（原像素值范围[0, 255]）
+                transforms.Normalize((0.1307,), (0.3081,)) # 用指定的均值(0.1307,)和标准差(0.3081,)对张量进行归一化;这两个数值通常是MNIST数据集（手写数字识别经典数据集）的统计值（训练集计算得到的均值/标准差），目的是让输入数据分布更稳定，提升模型表现
+            ])
+            
+            print(f"数字识别API已初始化，设备: {device}")
+
+        def preprocess_image(self, image):
+            """
+            预处理图像
+            
+            参数:
+                image: 可以是以下格式之一：
+                    1. PIL.Image对象
+                    2. numpy数组 (28x28 或 28x28x1 或 28x28x3)
+                    3. 文件路径 (str)
+            
+            返回:
+                预处理后的张量
+            """
+            from PIL import Image # 导入PIL（Python Imaging Library）库的Image模块，用于处理图像（如打开、格式转换）
+            import io # 导入io模块（用于处理I/O流)
+            
+            # 如果输入是文件路径
+            if isinstance(image, str):  # 判断输入是否为字符串
+                if os.path.exists(image):
+                    image = Image.open(image).convert('L')  # 将图像转换为灰度模式（'L'代表8位像素，黑白灰度，每个像素值0-255）
+                else:
+                    raise FileNotFoundError(f"文件不存在: {image}")
+                
+            # 如果输入是numpy数组
+            elif isinstance(image, np.ndarray):
+                # 确保是2D或3D数组,过 image.shape 的维度（2D 或 3D）和通道数，将其转换为灰度的 PIL 图像
+                if len(image.shape) == 2:  # 28x28  
+                    image = Image.fromarray(image.astype(np.uint8)) # 将数组转为 uint8 类型（图像像素值需是 0-255 的整数），再通过 Image.fromarray 转为 PIL 图像
+                elif len(image.shape) == 3:  # 28x28x1 或 28x28x3
+                    if image.shape[2] == 1:  # 单通道
+                        image = Image.fromarray(image[:,:,0].astype(np.uint8)) # 通过 image[:,:,0] 取第一个通道（去掉冗余的通道维度），转 uint8 后用 Image.fromarray 转 PIL 图像
+                    elif image.shape[2] == 3:  # RGB
+                        image = Image.fromarray(image.astype(np.uint8)).convert('L') # 转 uint8 后，用 .convert('L') 将 RGB 转为灰度图像（'L' 模式表示灰度，PIL 会自动按权重合并 RGB 通道
+                else:
+                    raise ValueError(f"不支持的numpy数组形状: {image.shape}")
+                
+            # 如果输入是字节流
+            elif isinstance(image, bytes):
+                image = Image.open(io.BytesIO(image)).convert('L') # 用 io.BytesIO(image) 将字节流转为“类文件对象”
+            
+            # 确保图像是28x28
+            if image.size != (28, 28):
+
+                #若尺寸不是 (28, 28)，则用 .resize((28, 28), Image.Resampling.LANCZOS) 缩放为 28×28。其中 LANCZOS 是一种高质量的重采样算法（兰茨奥斯滤波），能较好地保留细节
+                image = image.resize((28, 28), Image.Resampling.LANCZOS)
+            
+            # 应用预处理
+            tensor = self.transform(image)
+            
+            return tensor.unsqueeze(0).to(self.device)  # 添加批次维度
+        
+        def predict(self, image, return_probabilities=False):
+            """
+            预测手写数字
+            
+            参数:
+                image: 输入图像（支持多种格式）
+                return_probabilities: 是否返回所有数字的概率
+                
+            返回:
+                识别结果
+            """
+            # 预处理图像
+            input_tensor = self.preprocess_image(image)
+            
+            # 推理
+            with torch.no_grad():
+                output = self.model(input_tensor) # 使用模型对预处理后的图像进行预测，得到 output
+                probabilities = F.softmax(output, dim=1) # 对 output 应用 softmax 函数，得到每个类别的概率 probabilities
+                pred = torch.argmax(probabilities, dim=1) # 找到概率最高的类别索引，得到预测结果 pred
+                
+                confidence = probabilities[0, pred].item() # 获取预测类别的概率值，转换为 Python 标量
+
+            # 准备结果
+            result = {
+                'digit': pred.item(),
+                'confidence': confidence,
+                'all_probabilities': probabilities[0].cpu().numpy() if return_probabilities else None
+            }
+            
+            return result
+        
+        def predict_batch(self, images):
+            """批量预测"""
+            batch_tensors = []
+            
+            for image in images:
+                tensor = self.preprocess_image(image)
+                batch_tensors.append(tensor)
+            
+            # 合并批次
+            batch = torch.cat(batch_tensors, dim=0) # 使用 torch.cat 沿 dim=0（批次维度）拼接列表中的所有张量，将单张图像的张量合并为一个批次张量（例如：若每张图像预处理后是 [1, C, H, W]，合并后变为 [B, C, H, W]，其中 B 是图像数量）
+            
+            # 推理
+            with torch.no_grad():
+                outputs = self.model(batch)
+                probabilities = F.softmax(outputs, dim=1)
+                preds = torch.argmax(probabilities, dim=1)
+                confidences = probabilities[torch.arange(len(preds)), preds]
+            
+            results = []
+            for i in range(len(preds)):
+                results.append({
+                    'digit': preds[i].item(),
+                    'confidence': confidences[i].item(),
+                    'all_probabilities': probabilities[i].cpu().numpy()
+                })
+            
+            return results
+        
+        def visualize_prediction(self, image, prediction_result):
+            """可视化预测结果"""
+            from PIL import Image
+            
+            # 如果输入不是PIL图像，先转换;isinstance() 是 Python 中内置的类型检查函数，用于判断一个对象是否属于指定的类型（或类型元组）
+            if not isinstance(image, Image.Image):
+                if isinstance(image, str):
+                    image = Image.open(image).convert('L')
+                elif isinstance(image, np.ndarray):
+                    image = Image.fromarray(image.astype(np.uint8))
+            
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5)) # 使用 fig, axes 创建一个包含两个子图的图形
+            
+            # 左侧：显示图像
+            axes[0].imshow(image, cmap='gray')
+            axes[0].set_title('输入图像', fontsize=14)
+            axes[0].axis('off')
+            
+            # 右侧：显示概率分布
+            probs = prediction_result['all_probabilities']
+
+            if probs is not None:
+                digits = list(range(10))
+                colors = ['lightblue' if i != prediction_result['digit'] else 'red' for i in digits]
+                
+                bars = axes[1].bar(digits, probs * 100, color=colors, edgecolor='black')
+                axes[1].set_xlabel('数字', fontsize=12)
+                axes[1].set_ylabel('概率 (%)', fontsize=12)
+                axes[1].set_title('识别结果概率分布', fontsize=14)
+                axes[1].set_xticks(digits)
+                axes[1].set_ylim([0, 110])
+                axes[1].grid(True, alpha=0.3, axis='y')
+                
+                # 在每个柱子上添加数值
+                for bar, prob in zip(bars, probs):
+                    height = bar.get_height()
+                    axes[1].text(bar.get_x() + bar.get_width()/2., height + 1,
+                            f'{prob*100:.1f}%', ha='center', va='bottom', fontsize=9)
+                    
+            # 添加总体信息
+            plt.suptitle(f'识别结果: 数字 {prediction_result["digit"]} '
+                        f'(置信度: {prediction_result["confidence"]*100:.1f}%)', 
+                        fontsize=16, fontweight='bold', y=1.05)
+            
+            plt.tight_layout()
+            plt.show()
+            
+            return fig
+        
+    # 创建API实例
+    print("\n" + "="*60)
+    print("创建数字识别API")
+    print("="*60)
+
+    api = DigitRecognizerAPI(model_path='digit_recognizer_production.pt', device=device)
+
+    def test_api():
+        """测试API功能"""
+        print("\n测试API功能...")
+        
+        # 从测试集中随机选择一些样本进行测试
+        test_iter = iter(test_loader)
+        test_images, test_labels = next(test_iter)
+        
+        # 选择前5个样本
+        for i in range(5):
+            # 将张量转换为numpy数组（模拟真实输入）
+            image_np = test_images[i].squeeze().numpy() * 255  # 反标准化并转换为0-255
+            image_np = image_np.astype(np.uint8)
+            
+            true_label = test_labels[i].item()
+            
+            print(f"\n测试样本 {i+1}:")
+            print(f"  真实标签: {true_label}")
+            
+            # 测试预测
+            result = api.predict(image_np, return_probabilities=True)
+            
+            print(f"  预测结果: {result['digit']}")
+            print(f"  置信度: {result['confidence']*100:.2f}%")
+            
+            if result['digit'] == true_label:
+                print("  ✅ 预测正确")
+            else:
+                print("  ❌ 预测错误")
+            
+            # 可视化预测结果
+            api.visualize_prediction(image_np, result)
+            
+            # 短暂暂停以便观察
+            import time
+            time.sleep(1)
+
+    
+
